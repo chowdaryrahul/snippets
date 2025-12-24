@@ -1,0 +1,178 @@
+package com.example.migration.liquibase;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import liquibase.Scope;
+import liquibase.database.Database;
+import liquibase.exception.DatabaseException;
+import liquibase.exception.LockException;
+import liquibase.executor.Executor;
+import liquibase.executor.ExecutorService;
+import liquibase.lockservice.DatabaseChangeLogLock;
+import liquibase.lockservice.StandardLockService;
+import liquibase.logging.Logger;
+import liquibase.statement.core.RawSqlStatement;
+import liquibase.util.StringUtil;
+import liquibase.servicelocator.LiquibaseService;
+
+@LiquibaseService
+public class TrinoLowercaseLockService extends StandardLockService {
+    private static final Logger log = Scope.getCurrentScope().getLog(TrinoLowercaseLockService.class);
+
+    @Override
+    public int getPriority() {
+        // higher than StandardLockService (priority 1)
+        return 5;
+    }
+
+    @Override
+    public boolean supports(Database database) {
+        if (database == null) {
+            return false;
+        }
+        String shortName = database.getShortName();
+        String product = null;
+        try {
+            product = database.getDatabaseProductName();
+        } catch (DatabaseException ignored) {
+            // best effort
+        }
+        return "trino".equalsIgnoreCase(shortName)
+                || (product != null && product.toLowerCase(Locale.ROOT).contains("trino"));
+    }
+
+    @Override
+    public void init() throws DatabaseException {
+        Executor executor = executor();
+        String table = lockTable();
+        String create = "CREATE TABLE IF NOT EXISTS " + table + " ("
+                + quoted("id") + " integer, "
+                + quoted("locked") + " boolean, "
+                + quoted("lockgranted") + " timestamp, "
+                + quoted("lockedby") + " varchar"
+                + ")";
+        executor.execute(new RawSqlStatement(create));
+
+        Integer count = executor.queryForObject(
+                new RawSqlStatement("SELECT COUNT(*) FROM " + table + " WHERE " + quoted("id") + " = 1"),
+                Integer.class);
+        if (count == null || count == 0) {
+            executor.execute(new RawSqlStatement(
+                    "INSERT INTO " + table + " (" + quoted("id") + ", " + quoted("locked") + ") VALUES (1, false)"));
+        }
+        database.commit();
+        hasDatabaseChangeLogLockTable = Boolean.TRUE;
+        isDatabaseChangeLogLockTableInitialized = true;
+    }
+
+    @Override
+    public boolean acquireLock() throws LockException {
+        try {
+            init();
+            Executor executor = executor();
+            String lockedBy = resolveLockedBy();
+            String now = database.getCurrentDateTimeFunction();
+            String sql = "UPDATE " + lockTable() + " SET "
+                    + quoted("locked") + " = TRUE, "
+                    + quoted("lockgranted") + " = " + now + ", "
+                    + quoted("lockedby") + " = '" + database.escapeStringForDatabase(lockedBy) + "' "
+                    + "WHERE " + quoted("id") + " = 1 AND (" + quoted("locked") + " IS NULL OR "
+                    + quoted("locked") + " = FALSE)";
+            int updated = executor.update(new RawSqlStatement(sql));
+            database.commit();
+            hasChangeLogLock = updated > 0;
+            return hasChangeLogLock;
+        } catch (Exception e) {
+            throw new LockException(e);
+        }
+    }
+
+    @Override
+    public void releaseLock() throws LockException {
+        try {
+            Executor executor = executor();
+            String sql = "UPDATE " + lockTable() + " SET "
+                    + quoted("locked") + " = FALSE, "
+                    + quoted("lockgranted") + " = NULL, "
+                    + quoted("lockedby") + " = NULL "
+                    + "WHERE " + quoted("id") + " = 1";
+            executor.update(new RawSqlStatement(sql));
+            database.commit();
+        } catch (Exception e) {
+            throw new LockException(e);
+        } finally {
+            hasChangeLogLock = false;
+        }
+    }
+
+    @Override
+    public DatabaseChangeLogLock[] listLocks() throws LockException {
+        try {
+            init();
+            Executor executor = executor();
+            String sql = "SELECT "
+                    + quoted("id") + " AS id, "
+                    + quoted("locked") + " AS locked, "
+                    + quoted("lockgranted") + " AS lockgranted, "
+                    + quoted("lockedby") + " AS lockedby "
+                    + "FROM " + lockTable() + " WHERE " + quoted("locked") + " = TRUE";
+            @SuppressWarnings("unchecked")
+            List<Map<String, ?>> rows = executor.queryForList(new RawSqlStatement(sql));
+            List<DatabaseChangeLogLock> locks = new ArrayList<>();
+            for (Map<String, ?> row : rows) {
+                Object lockedValue = row.get("locked");
+                if (!(lockedValue instanceof Boolean locked) || !locked.booleanValue()) {
+                    continue;
+                }
+                Number id = (Number) row.get("id");
+                Object granted = row.get("lockgranted");
+                java.util.Date date = null;
+                if (granted instanceof java.util.Date d) {
+                    date = d;
+                } else if (granted instanceof java.time.Instant instant) {
+                    date = java.util.Date.from(instant);
+                } else if (granted instanceof java.time.LocalDateTime ldt) {
+                    date = java.util.Date.from(ldt.atZone(java.time.ZoneId.systemDefault()).toInstant());
+                }
+                String lockedBy = (String) row.get("lockedby");
+                locks.add(new DatabaseChangeLogLock(id == null ? 0 : id.intValue(), date, lockedBy));
+            }
+            return locks.toArray(DatabaseChangeLogLock[]::new);
+        } catch (Exception e) {
+            throw new LockException(e);
+        }
+    }
+
+    private Executor executor() throws DatabaseException {
+        return Scope.getCurrentScope()
+                .getSingleton(ExecutorService.class)
+                .getExecutor("jdbc", database);
+    }
+
+    private String lockTable() {
+        return database.escapeTableName(
+                database.getLiquibaseCatalogName(),
+                database.getLiquibaseSchemaName(),
+                database.getDatabaseChangeLogLockTableName().toLowerCase(Locale.ROOT));
+    }
+
+    private String quoted(String name) {
+        return "\"" + name + "\"";
+    }
+
+    private String resolveLockedBy() throws DatabaseException {
+        String user = database.getConnection().getConnectionUserName();
+        if (StringUtil.isNotEmpty(user)) {
+            return user;
+        }
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return "unknown-host";
+        }
+    }
+}
