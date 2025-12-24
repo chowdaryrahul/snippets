@@ -1,0 +1,333 @@
+package com.example.msaasmigration.liquibase;
+
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import liquibase.Scope;
+import liquibase.change.CheckSum;
+import liquibase.changelog.AbstractChangeLogHistoryService;
+import liquibase.changelog.ChangeSet;
+import liquibase.changelog.RanChangeSet;
+import liquibase.database.Database;
+import liquibase.exception.DatabaseException;
+import liquibase.exception.LiquibaseException;
+import liquibase.executor.Executor;
+import liquibase.executor.ExecutorService;
+import liquibase.servicelocator.LiquibaseService;
+import liquibase.statement.core.RawSqlStatement;
+import liquibase.util.LiquibaseUtil;
+import liquibase.Labels;
+import liquibase.ContextExpression;
+import liquibase.util.StringUtil;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+@LiquibaseService
+public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHistoryService {
+    private static final Logger log = LogManager.getLogger(TrinoLowercaseChangeLogHistoryService.class);
+
+    private String deploymentId;
+
+    @Override
+    public int getPriority() {
+        // Higher than StandardChangeLogHistoryService (1) so this wins for Trino.
+        return 5;
+    }
+
+    @Override
+    public boolean supports(Database database) {
+        if (database == null) {
+            return false;
+        }
+        String shortName = database.getShortName();
+        String product = null;
+        try {
+            product = database.getDatabaseProductName();
+        } catch (DatabaseException ignored) {
+            // best effort only
+        }
+        String productLower = product == null ? null : product.toLowerCase(Locale.ROOT);
+        return "trino".equalsIgnoreCase(shortName)
+                || (productLower != null && (productLower.contains("trino") || productLower.contains("starburst")));
+    }
+
+    @Override
+    public void init() throws DatabaseException {
+        Executor executor = executor();
+        String table = changeLogTable();
+
+        String create = "CREATE TABLE IF NOT EXISTS " + table + " ("
+                + "id varchar, "
+                + "author varchar, "
+                + "filename varchar, "
+                + "dateexecuted timestamp, "
+                + "orderexecuted integer, "
+                + "exectype varchar, "
+                + "md5sum varchar, "
+                + "description varchar, "
+                + "comments varchar, "
+                + "tag varchar, "
+                + "liquibase varchar, "
+                + "contexts varchar, "
+                + "labels varchar, "
+                + "deployment_id varchar"
+                + ")";
+        executor.execute(new RawSqlStatement(create));
+    }
+
+    @Override
+    public List<RanChangeSet> getRanChangeSets() throws DatabaseException {
+        init();
+        Executor executor = executor();
+        String sql = "SELECT id, author, filename, dateexecuted, orderexecuted, exectype, md5sum, "
+                + "description, comments, tag, liquibase, contexts, labels, deployment_id "
+                + "FROM " + changeLogTable() + " ORDER BY dateexecuted, orderexecuted";
+        @SuppressWarnings("unchecked")
+        List<Map<String, ?>> rows = executor.queryForList(new RawSqlStatement(sql));
+        List<RanChangeSet> ran = new ArrayList<>();
+        for (Map<String, ?> row : rows) {
+            RanChangeSet rcs = mapRowToRanChangeSet(row);
+            ran.add(rcs);
+        }
+        return ran;
+    }
+
+    @Override
+    public void setExecType(ChangeSet changeSet, ChangeSet.ExecType execType) throws DatabaseException {
+        init();
+        Executor executor = executor();
+
+        String id = changeSet.getId();
+        String author = changeSet.getAuthor();
+        String file = changeSet.getFilePath();
+        String description = changeSet.getDescription();
+        String comments = changeSet.getComments();
+        String contexts = changeSet.getContexts() == null ? null : changeSet.getContexts().toString();
+        String labels = changeSet.getLabels() == null ? null : changeSet.getLabels().toString();
+        String md5 = changeSet.generateCheckSum().toString();
+        String deployment = getDeploymentId();
+        String now = getDatabase().getCurrentDateTimeFunction();
+        String liquibaseVersion = LiquibaseUtil.getBuildVersion();
+
+        int count = executor.queryForObject(
+                new RawSqlStatement("SELECT COUNT(*) FROM " + changeLogTable()
+                        + " WHERE id = '" + escape(id) + "'"
+                        + " AND author = '" + escape(author) + "'"
+                        + " AND filename = '" + escape(file) + "'"),
+                Integer.class);
+
+        int orderExecuted = getNextSequenceValue();
+
+        if (count == 0) {
+            String insert = "INSERT INTO " + changeLogTable()
+                    + " (id, author, filename, dateexecuted, orderexecuted, exectype, md5sum, "
+                    + "description, comments, tag, liquibase, contexts, labels, deployment_id) VALUES ("
+                    + "'" + escape(id) + "', "
+                    + "'" + escape(author) + "', "
+                    + "'" + escape(file) + "', "
+                    + now + ", "
+                    + orderExecuted + ", "
+                    + "'" + execType.name() + "', "
+                    + "'" + escape(md5) + "', "
+                    + nullable(description) + ", "
+                    + nullable(comments) + ", "
+                    + "NULL, "
+                    + nullable(liquibaseVersion) + ", "
+                    + nullable(contexts) + ", "
+                    + nullable(labels) + ", "
+                    + nullable(deployment)
+                    + ")";
+            executor.execute(new RawSqlStatement(insert));
+        } else {
+            String update = "UPDATE " + changeLogTable() + " SET "
+                    + "dateexecuted = " + now + ", "
+                    + "orderexecuted = " + orderExecuted + ", "
+                    + "exectype = '" + execType.name() + "', "
+                    + "md5sum = '" + escape(md5) + "', "
+                    + "description = " + nullable(description) + ", "
+                    + "comments = " + nullable(comments) + ", "
+                    + "contexts = " + nullable(contexts) + ", "
+                    + "labels = " + nullable(labels) + ", "
+                    + "deployment_id = " + nullable(deployment) + ", "
+                    + "liquibase = " + nullable(liquibaseVersion) + " "
+                    + "WHERE id = '" + escape(id) + "'"
+                    + " AND author = '" + escape(author) + "'"
+                    + " AND filename = '" + escape(file) + "'";
+            executor.execute(new RawSqlStatement(update));
+        }
+    }
+
+    @Override
+    public void removeFromHistory(ChangeSet changeSet) throws DatabaseException {
+        init();
+        Executor executor = executor();
+        String sql = "DELETE FROM " + changeLogTable()
+                + " WHERE id = '" + escape(changeSet.getId()) + "'"
+                + " AND author = '" + escape(changeSet.getAuthor()) + "'"
+                + " AND filename = '" + escape(changeSet.getFilePath()) + "'";
+        executor.execute(new RawSqlStatement(sql));
+    }
+
+    @Override
+    public int getNextSequenceValue() throws LiquibaseException {
+        try {
+            init();
+            Executor executor = executor();
+            Integer value = executor.queryForObject(
+                    new RawSqlStatement("SELECT COALESCE(MAX(orderexecuted), 0) + 1 FROM " + changeLogTable()),
+                    Integer.class);
+            return value == null ? 1 : value;
+        } catch (DatabaseException e) {
+            throw new LiquibaseException(e);
+        }
+    }
+
+    @Override
+    public void tag(String tag) throws DatabaseException {
+        init();
+        Executor executor = executor();
+        String sql = "UPDATE " + changeLogTable() + " SET tag = '" + escape(tag) + "' "
+                + "WHERE orderexecuted = (SELECT MAX(orderexecuted) FROM " + changeLogTable() + ")";
+        executor.execute(new RawSqlStatement(sql));
+    }
+
+    @Override
+    public boolean tagExists(String tag) throws DatabaseException {
+        init();
+        Executor executor = executor();
+        Integer count = executor.queryForObject(
+                new RawSqlStatement("SELECT COUNT(*) FROM " + changeLogTable() + " WHERE tag = '" + escape(tag) + "'"),
+                Integer.class);
+        return count != null && count > 0;
+    }
+
+    @Override
+    public void clearAllCheckSums() throws LiquibaseException {
+        try {
+            init();
+            Executor executor = executor();
+            executor.execute(new RawSqlStatement("UPDATE " + changeLogTable() + " SET md5sum = NULL"));
+        } catch (DatabaseException e) {
+            throw new LiquibaseException(e);
+        }
+    }
+
+    @Override
+    public void destroy() {
+        // nothing to clean up
+    }
+
+    @Override
+    public String getDeploymentId() {
+        if (deploymentId == null) {
+            generateDeploymentId();
+        }
+        return deploymentId;
+    }
+
+    @Override
+    public void resetDeploymentId() {
+        deploymentId = null;
+    }
+
+    @Override
+    public void generateDeploymentId() {
+        deploymentId = "deploy-" + UUID.randomUUID();
+    }
+
+    @Override
+    public boolean isDatabaseChecksumsCompatible() {
+        return true;
+    }
+
+    @Override
+    public boolean hasDatabaseChangeLogTable() throws DatabaseException {
+        init();
+        Executor executor = executor();
+        try {
+            executor.queryForObject(
+                    new RawSqlStatement("SELECT COUNT(*) FROM " + changeLogTable() + " WHERE 1=0"),
+                    Integer.class);
+            return true;
+        } catch (DatabaseException ex) {
+            log.debug("ChangeLog table probe failed: {}", ex.getMessage());
+            return false;
+        }
+    }
+
+    private RanChangeSet mapRowToRanChangeSet(Map<String, ?> row) {
+        RanChangeSet rcs = new RanChangeSet();
+        rcs.setId((String) row.get("id"));
+        rcs.setAuthor((String) row.get("author"));
+        String filename = (String) row.get("filename");
+        rcs.setChangeLog(filename);
+        rcs.setStoredChangeLog(filename);
+        rcs.setComments((String) row.get("comments"));
+        rcs.setDescription((String) row.get("description"));
+        rcs.setTag((String) row.get("tag"));
+        rcs.setDeploymentId((String) row.get("deployment_id"));
+
+        Object date = row.get("dateexecuted");
+        if (date instanceof Timestamp ts) {
+            rcs.setDateExecuted(new Date(ts.getTime()));
+        } else if (date instanceof Date d) {
+            rcs.setDateExecuted(d);
+        }
+
+        Object order = row.get("orderexecuted");
+        if (order instanceof Number n) {
+            rcs.setOrderExecuted(n.intValue());
+        }
+
+        Object exec = row.get("exectype");
+        if (exec != null) {
+            try {
+                rcs.setExecType(ChangeSet.ExecType.valueOf(exec.toString()));
+            } catch (IllegalArgumentException ex) {
+                log.warn("Unknown execType '{}' in changelog history, leaving unset", exec);
+            }
+        }
+
+        Object md5 = row.get("md5sum");
+        if (md5 != null) {
+            rcs.setLastCheckSum(CheckSum.parse(md5.toString()));
+        }
+
+        String contexts = (String) row.get("contexts");
+        rcs.setContextExpression(StringUtil.isEmpty(contexts) ? new ContextExpression() : new ContextExpression(contexts));
+
+        String labels = (String) row.get("labels");
+        rcs.setLabels(StringUtil.isEmpty(labels) ? new Labels() : new Labels(labels));
+
+        return rcs;
+    }
+
+    private Executor executor() throws DatabaseException {
+        return Scope.getCurrentScope()
+                .getSingleton(ExecutorService.class)
+                .getExecutor("jdbc", getDatabase());
+    }
+
+    private String changeLogTable() {
+        Database db = getDatabase();
+        return db.escapeTableName(
+                db.getLiquibaseCatalogName(),
+                db.getLiquibaseSchemaName(),
+                db.getDatabaseChangeLogTableName().toLowerCase(Locale.ROOT));
+    }
+
+    private String escape(String value) throws DatabaseException {
+        return getDatabase().escapeStringForDatabase(value == null ? "" : value);
+    }
+
+    private String nullable(String value) throws DatabaseException {
+        if (value == null) {
+            return "NULL";
+        }
+        return "'" + escape(value) + "'";
+    }
+}
