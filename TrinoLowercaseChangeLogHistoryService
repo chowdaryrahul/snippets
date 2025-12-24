@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import liquibase.ChecksumVersion;
 import liquibase.Scope;
 import liquibase.change.CheckSum;
 import liquibase.changelog.AbstractChangeLogHistoryService;
@@ -40,19 +41,7 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
 
     @Override
     public boolean supports(Database database) {
-        if (database == null) {
-            return false;
-        }
-        String shortName = database.getShortName();
-        String product = null;
-        try {
-            product = database.getDatabaseProductName();
-        } catch (DatabaseException ignored) {
-            // best effort only
-        }
-        String productLower = product == null ? null : product.toLowerCase(Locale.ROOT);
-        return "trino".equalsIgnoreCase(shortName)
-                || (productLower != null && (productLower.contains("trino") || productLower.contains("starburst")));
+        return isTrino(database);
     }
 
     @Override
@@ -83,8 +72,21 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
     public List<RanChangeSet> getRanChangeSets() throws DatabaseException {
         init();
         Executor executor = executor();
-        String sql = "SELECT id, author, filename, dateexecuted, orderexecuted, exectype, md5sum, "
-                + "description, comments, tag, liquibase, contexts, labels, deployment_id "
+        String sql = "SELECT "
+                + "id AS id, "
+                + "author AS author, "
+                + "filename AS filename, "
+                + "dateexecuted AS dateexecuted, "
+                + "orderexecuted AS orderexecuted, "
+                + "exectype AS exectype, "
+                + "md5sum AS md5sum, "
+                + "description AS description, "
+                + "comments AS comments, "
+                + "tag AS tag, "
+                + "liquibase AS liquibase, "
+                + "contexts AS contexts, "
+                + "labels AS labels, "
+                + "deployment_id AS deployment_id "
                 + "FROM " + changeLogTable() + " ORDER BY dateexecuted, orderexecuted";
         @SuppressWarnings("unchecked")
         List<Map<String, ?>> rows = executor.queryForList(new RawSqlStatement(sql));
@@ -108,7 +110,7 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
         String comments = changeSet.getComments();
         String contexts = changeSet.getContexts() == null ? null : changeSet.getContexts().toString();
         String labels = changeSet.getLabels() == null ? null : changeSet.getLabels().toString();
-        String md5 = changeSet.generateCheckSum().toString();
+        String md5 = changeSet.generateCheckSum(ChecksumVersion.latest()).toString();
         String deployment = getDeploymentId();
         String now = getDatabase().getCurrentDateTimeFunction();
         String liquibaseVersion = LiquibaseUtil.getBuildVersion();
@@ -120,7 +122,12 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
                         + " AND filename = '" + escape(file) + "'"),
                 Integer.class);
 
-        int orderExecuted = getNextSequenceValue();
+        int orderExecuted;
+        try {
+            orderExecuted = getNextSequenceValue();
+        } catch (LiquibaseException e) {
+            throw new DatabaseException("Failed to allocate orderexecuted for changelog history", e);
+        }
 
         if (count == 0) {
             String insert = "INSERT INTO " + changeLogTable()
@@ -244,7 +251,6 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
         return true;
     }
 
-    @Override
     public boolean hasDatabaseChangeLogTable() throws DatabaseException {
         init();
         Executor executor = executor();
@@ -253,7 +259,7 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
                     new RawSqlStatement("SELECT COUNT(*) FROM " + changeLogTable() + " WHERE 1=0"),
                     Integer.class);
             return true;
-        } catch (DatabaseException ex) {
+        } catch (Exception ex) {
             log.debug("ChangeLog table probe failed: {}", ex.getMessage());
             return false;
         }
@@ -261,29 +267,29 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
 
     private RanChangeSet mapRowToRanChangeSet(Map<String, ?> row) {
         RanChangeSet rcs = new RanChangeSet();
-        rcs.setId((String) row.get("id"));
-        rcs.setAuthor((String) row.get("author"));
-        String filename = (String) row.get("filename");
+        rcs.setId(value(row, "id"));
+        rcs.setAuthor(value(row, "author"));
+        String filename = value(row, "filename");
         rcs.setChangeLog(filename);
         rcs.setStoredChangeLog(filename);
-        rcs.setComments((String) row.get("comments"));
-        rcs.setDescription((String) row.get("description"));
-        rcs.setTag((String) row.get("tag"));
-        rcs.setDeploymentId((String) row.get("deployment_id"));
+        rcs.setComments(value(row, "comments"));
+        rcs.setDescription(value(row, "description"));
+        rcs.setTag(value(row, "tag"));
+        rcs.setDeploymentId(value(row, "deployment_id"));
 
-        Object date = row.get("dateexecuted");
+        Object date = valueObj(row, "dateexecuted");
         if (date instanceof Timestamp ts) {
             rcs.setDateExecuted(new Date(ts.getTime()));
         } else if (date instanceof Date d) {
             rcs.setDateExecuted(d);
         }
 
-        Object order = row.get("orderexecuted");
+        Object order = valueObj(row, "orderexecuted");
         if (order instanceof Number n) {
             rcs.setOrderExecuted(n.intValue());
         }
 
-        Object exec = row.get("exectype");
+        Object exec = valueObj(row, "exectype");
         if (exec != null) {
             try {
                 rcs.setExecType(ChangeSet.ExecType.valueOf(exec.toString()));
@@ -292,18 +298,35 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
             }
         }
 
-        Object md5 = row.get("md5sum");
+        Object md5 = valueObj(row, "md5sum");
         if (md5 != null) {
             rcs.setLastCheckSum(CheckSum.parse(md5.toString()));
         }
 
-        String contexts = (String) row.get("contexts");
+        String contexts = value(row, "contexts");
         rcs.setContextExpression(StringUtil.isEmpty(contexts) ? new ContextExpression() : new ContextExpression(contexts));
 
-        String labels = (String) row.get("labels");
+        String labels = value(row, "labels");
         rcs.setLabels(StringUtil.isEmpty(labels) ? new Labels() : new Labels(labels));
 
         return rcs;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String value(Map<String, ?> row, String key) {
+        Object val = valueObj(row, key);
+        return val == null ? null : val.toString();
+    }
+
+    private Object valueObj(Map<String, ?> row, String key) {
+        if (row.containsKey(key)) {
+            return row.get(key);
+        }
+        String upper = key.toUpperCase(Locale.ROOT);
+        if (row.containsKey(upper)) {
+            return row.get(upper);
+        }
+        return null;
     }
 
     private Executor executor() throws DatabaseException {
@@ -329,5 +352,19 @@ public class TrinoLowercaseChangeLogHistoryService extends AbstractChangeLogHist
             return "NULL";
         }
         return "'" + escape(value) + "'";
+    }
+
+    private boolean isTrino(Database database) {
+        if (database == null) {
+            return false;
+        }
+        String shortName = database.getShortName();
+        String shortLower = shortName == null ? "" : shortName.toLowerCase(Locale.ROOT);
+        if (shortLower.contains("trino") || shortLower.contains("starburst")) {
+            return true;
+        }
+        String product = database.getDatabaseProductName();
+        String productLower = product == null ? "" : product.toLowerCase(Locale.ROOT);
+        return productLower.contains("trino") || productLower.contains("starburst");
     }
 }
